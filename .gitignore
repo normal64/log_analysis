@@ -1,5 +1,6 @@
 
-config-dump/
+config-dump/*
+!config-dump/.gitkeep
 tasks/
 *.clineignore
 *.clinerules
