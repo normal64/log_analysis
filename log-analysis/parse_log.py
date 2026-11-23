@@ -1,13 +1,17 @@
 import os
 import re
 import glob
+import json
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, defaultdict
+from datetime import datetime
 
-FILE_PATH = 'EventLog.xml'
-REPORT_PATH = 'bugs_report_anon.txt'
-CONFIG_DUMP_REL = '../config-dump'
-TASKS_DIR = '../tasks'
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILE_PATH = os.path.join(BASE_DIR, 'EventLog.xml')
+REPORT_PATH = os.path.join(BASE_DIR, 'bugs_report_anon.txt')
+KNOWN_BUGS_PATH = os.path.join(BASE_DIR, 'known_bugs.json')
+CONFIG_DUMP_REL = os.path.normpath(os.path.join(BASE_DIR, '..', 'config-dump'))
+TASKS_DIR = os.path.normpath(os.path.join(BASE_DIR, '..', 'tasks'))
 
 INVALID_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 SINGLE_LINE_USER_MSG = re.compile(r'^\{[^}]+\}:\s*.+$')
@@ -89,7 +93,7 @@ def build_anonymizer(root):
 
 
 def make_signature(lines):
-    """Формирует устойчивый ключ группировки, очищая номера документов, даты, UUID и имена в кавычках."""
+    """Единый ключ схлопывания для INDEX.md, bugs_report_anon.txt и known_bugs.json."""
     first_line = lines[0] if lines else 'Без текста'
     module_line = next((l for l in lines if l.startswith('{')), '')
 
@@ -98,12 +102,20 @@ def make_signature(lines):
         if len(prefix) >= 12 and rest.strip():
             first_line = prefix
 
-    norm = UUID_RE.sub('<UUID>', first_line)
+    norm = re.sub(
+        r'(менеджер объекта|объекта|реквизит|поля|свойства)\s+[А-ЯЁA-Z0-9_]+',
+        r'\1 <OBJ>',
+        first_line,
+        flags=re.IGNORECASE,
+    )
+    norm = re.sub(r'\([^)]+\)', '(<VAL>)', norm)
+    norm = UUID_RE.sub('<UUID>', norm)
     norm = QUOTED_RE.sub('"<STR>"', norm)
     norm = DOC_NUM_RE.sub('<NUM>', norm)
     norm = re.sub(r'\d+', 'N', norm)
+    norm = re.sub(r'идентификатор\w*', 'идентификатор<X>', norm, flags=re.IGNORECASE)
 
-    return f"{norm}\n{module_line}".strip()
+    return f"{module_line}\n{norm}".strip() if module_line else norm.strip()
 
 
 def resolve_1c_path(stack_location):
@@ -168,7 +180,7 @@ def extract_stack_targets(lines):
                         'line': line_num,
                         'exists': exists,
                         'snippet': code_snippet,
-                        'raw_loc': loc
+                        'raw_loc': loc,
                     })
     return targets
 
@@ -191,14 +203,29 @@ def is_user_validation_error(comment_text):
     user_messages = [
         'запрет продаж', 'период документа закрыт', 'не заполнено', 'не заполнен',
         'документ уже в бегунке', 'запрещено менять', 'слишком сложный поисковый запрос',
-        'пересекаются элементы отбора'
+        'пересекаются элементы отбора',
     ]
     return any(msg in text_lower for msg in user_messages)
 
 
+def load_known_bugs():
+    if os.path.exists(KNOWN_BUGS_PATH):
+        try:
+            with open(KNOWN_BUGS_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_known_bugs(known_bugs):
+    with open(KNOWN_BUGS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(known_bugs, f, ensure_ascii=False, indent=2)
+
+
 def main():
     if not os.path.exists(FILE_PATH):
-        print(f"❌ Файл {FILE_PATH} не найден!")
+        print(f"Файл {FILE_PATH} не найден!")
         return
 
     with open(FILE_PATH, 'r', encoding='utf-8-sig', errors='replace') as f:
@@ -206,13 +233,19 @@ def main():
 
     root = ET.fromstring(clean_xml)
     anonymize = build_anonymizer(root)
+    known_bugs = load_known_bugs()
 
     unique_errors = {}
     error_counts = Counter()
+    error_variants = defaultdict(list)
+    total_events = 0
 
     for elem in root.iter():
         if strip_ns(elem.tag) == 'Event':
             data = {strip_ns(child.tag): (child.text or '').strip() for child in elem}
+            if 'Level' not in data:
+                continue
+            total_events += 1
             if data.get('Level') == 'Error':
                 comment_text = data.get('Comment') or ''
                 if comment_text and not is_user_validation_error(comment_text):
@@ -221,23 +254,63 @@ def main():
                     signature = make_signature(lines)
 
                     error_counts[signature] += 1
+                    anon_first = anonymize(first_line)
+                    if anon_first not in error_variants[signature] and len(error_variants[signature]) < 10:
+                        error_variants[signature].append(anon_first)
+
                     if signature not in unique_errors:
                         raw_user = data.get('UserName') or 'Система / Фоновое'
                         anon_lines = [anonymize(l) for l in lines[:12]]
                         unique_errors[signature] = {
-                            'title': anonymize(first_line),
+                            'title': anon_first,
                             'date': data.get('Date', ''),
                             'user': mask_full_name(raw_user),
                             'app': data.get('ApplicationPresentation', ''),
                             'details': "\n".join(anon_lines),
-                            'targets': extract_stack_targets(lines)
+                            'targets': extract_stack_targets(lines),
                         }
 
-    summary_lines = [f"🐞 Найдено уникальных технических ошибок: {len(unique_errors)}\n", "=" * 70]
-    for sig, count in error_counts.most_common():
+    new_bugs_count = 0
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+    for sig, count in error_counts.items():
         info = unique_errors[sig]
-        summary_lines.append(f"🔴 ПОВТОРЕНИЙ: {count} | {info['date']} | {info['app']} | {info['user']}")
+        event_date = info['date'] or now_str
+        if sig not in known_bugs:
+            info['is_new'] = True
+            info['first_seen'] = event_date
+            new_bugs_count += 1
+            known_bugs[sig] = {
+                'title': info['title'],
+                'first_seen': event_date,
+                'last_seen': event_date,
+                'total_seen_count': count,
+            }
+        else:
+            info['is_new'] = False
+            info['first_seen'] = known_bugs[sig].get('first_seen', event_date)
+            known_bugs[sig]['last_seen'] = event_date
+            known_bugs[sig]['total_seen_count'] = known_bugs[sig].get('total_seen_count', 0) + count
+
+    save_known_bugs(known_bugs)
+
+    sorted_bugs = sorted(
+        error_counts.items(),
+        key=lambda item: (not unique_errors[item[0]]['is_new'], -item[1])
+    )
+
+    summary_lines = [
+        f"Всего событий в ЖР: {total_events} | Уникальных ошибок: {len(unique_errors)} | Новых [NEW!]: {new_bugs_count}\n",
+        "=" * 70,
+    ]
+    for sig, count in sorted_bugs:
+        info = unique_errors[sig]
+        badge = "[NEW!] " if info['is_new'] else f"(Впервые: {info['first_seen']}) "
+        summary_lines.append(f"ПОВТОРЕНИЙ: {count} | {badge}{info['date']} | {info['app']} | {info['user']}")
         summary_lines.append(info['details'])
+        variants = error_variants[sig]
+        if len(variants) > 1:
+            summary_lines.append("Варианты: " + " | ".join(variants))
         summary_lines.append("-" * 70)
 
     with open(REPORT_PATH, 'w', encoding='utf-8') as out:
@@ -246,43 +319,66 @@ def main():
     os.makedirs(TASKS_DIR, exist_ok=True)
     for old_file in glob.glob(os.path.join(TASKS_DIR, 'bug_*.md')):
         os.remove(old_file)
+    old_diag = os.path.join(TASKS_DIR, 'DIAGNOSIS_REPORT.md')
+    if os.path.exists(old_diag):
+        os.remove(old_diag)
 
     index_lines = [
         "# Сводка технических ошибок из ЖР 1С\n",
-        f"Всего уникальных ошибок: **{len(unique_errors)}**\n",
-        "| Файл задачи | Повторений | Ошибка | Целевой модуль |",
-        "| :--- | :---: | :--- | :--- |"
+        f"Всего событий в ЖР: **{total_events}** | Уникальных ошибок: **{len(unique_errors)}** | Новых после прошлых проверок: **{new_bugs_count}**\n",
+        "| Файл задачи | Статус | Повторений | Ошибка | Целевой модуль |",
+        "| :--- | :---: | :---: | :--- | :--- |",
     ]
 
-    for idx, (sig, count) in enumerate(error_counts.most_common(), start=1):
+    for idx, (sig, count) in enumerate(sorted_bugs, start=1):
         info = unique_errors[sig]
         bug_filename = f"bug_{idx:02d}.md"
         bug_filepath = os.path.join(TASKS_DIR, bug_filename)
 
+        status_badge = "**[NEW!]**" if info['is_new'] else f"с {info['first_seen'][:10]}"
+        title_prefix = "[NEW!] " if info['is_new'] else ""
+        first_seen_val = info['first_seen']
+        status_text = (
+            "Новая ошибка (впервые зафиксирована)"
+            if info['is_new']
+            else f"Известная ошибка (впервые: {first_seen_val})"
+        )
+
         md = [
-            f"# Задача #{idx:02d}: {info['title']}\n",
-            f"- **Повторений в ЖР:** {count}",
-            f"- **Первое появление:** {info['date']}",
+            f"# Задача #{idx:02d}: {title_prefix}{info['title']}\n",
+            f"- **Статус:** {status_text}",
+            f"- **Повторений в текущей выгрузке:** {count}",
+            f"- **Время в выгрузке:** {info['date']}",
             f"- **Приложение:** {info['app']}",
             f"- **Пользователь (обезличено):** {info['user']}\n",
+        ]
+
+        variants = error_variants[sig]
+        if len(variants) > 1:
+            md.append("## Зафиксированные вариации ошибки в этом же месте кода\n")
+            for v in variants:
+                md.append(f"- `{v}`")
+            md.append("")
+
+        md.extend([
             "## Текст ошибки и стек вызовов\n",
             "```text",
             info['details'],
-            "```\n"
-        ]
+            "```\n",
+        ])
 
         if info['targets']:
             first_target = info['targets'][0]
             md.append("## Файлы конфигурации для анализа\n")
             for t in info['targets']:
-                status = "✅ найден" if t['exists'] else "⚠️ не найден в config-dump"
+                status = "найден" if t['exists'] else "не найден в config-dump"
                 md.append(f"- `{t['bsl_path']}` — **строка {t['line']}** ({status})")
                 if t['snippet']:
                     md.append(f"  - Код в стеке: `{t['snippet']}`")
             md.append("\n## Инструкция для агента\n")
             md.append(
                 f"Открой указанный файл `{first_target['bsl_path']}` вокруг строки **{first_target['line']}** "
-                "(прочитай ±60 строк) и проследи стек вызовов от действия пользователя к месту сбоя. "
+                "(прочитай ±50 строк) и проследи стек вызовов от действия пользователя к месту сбоя. "
                 "Определи: 1) Точное место, 2) Причину падения, 3) Пошаговые сценарии воспроизведения "
                 "в пользовательском режиме (от самого вероятного к менее вероятным). Исправления кода не пиши."
             )
@@ -295,16 +391,17 @@ def main():
         with open(bug_filepath, 'w', encoding='utf-8') as bf:
             bf.write("\n".join(md))
 
-        short_title = info['title'][:75].replace('|', '/')
-        index_lines.append(f"| `{bug_filename}` | {count} | {short_title} | {primary_target} |")
+        short_title = info['title'][:70].replace('|', '/')
+        index_lines.append(f"| `{bug_filename}` | {status_badge} | {count} | {short_title} | {primary_target} |")
 
     index_path = os.path.join(TASKS_DIR, 'INDEX.md')
     with open(index_path, 'w', encoding='utf-8') as idxf:
         idxf.write("\n".join(index_lines))
 
-    print(f"✅ Обработано уникальных ошибок: {len(unique_errors)}")
-    print(f"📄 Сводный отчёт: {os.path.abspath(REPORT_PATH)}")
-    print(f"🗂 Карточки задач для Cline созданы в: {os.path.abspath(TASKS_DIR)} (см. INDEX.md)")
+    print(f"Обработано событий: {total_events} | Уникальных ошибок: {len(unique_errors)} | Новых [NEW!]: {new_bugs_count}")
+    print(f"База знаний: {KNOWN_BUGS_PATH}")
+    print(f"Сводный отчёт: {REPORT_PATH}")
+    print(f"Карточки задач: {TASKS_DIR}")
 
 
 if __name__ == '__main__':
