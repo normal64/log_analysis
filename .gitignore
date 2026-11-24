@@ -19,6 +19,7 @@ tasks/
 
 log-analysis/EventLog.xml
 log-analysis/bugs_report_anon.txt
+log-analysis/known_bugs.json
 log-analysis/*.log
 
 
