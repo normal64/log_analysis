@@ -2,11 +2,12 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 if (-not (Test-Path 'EventLog.xml')) {
-    throw "Не найден файл log-analysis\EventLog.xml! Положите выгрузку ЖР в папку log-analysis."
+    throw "File log-analysis\EventLog.xml not found! Put the EventLog export into log-analysis folder."
 }
+
 $bslCount = (Get-ChildItem '..\config-dump' -Filter '*.bsl' -Recurse -ErrorAction SilentlyContinue).Count
 if ($bslCount -eq 0) {
-    Write-Warning "В папке config-dump не найдено .bsl файлов! Анализ по коду будет недоступен."
+    Write-Warning "No .bsl files found in config-dump! Source code analysis will be unavailable."
 }
 
 # 1. Удаляем все старые файлы от предыдущего прогона
