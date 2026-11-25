@@ -1,7 +1,8 @@
 
 config-dump/*
 !config-dump/.gitkeep
-tasks/
+tasks/*
+!tasks/.gitkeep
 *.clineignore
 *.clinerules
 *.cf
