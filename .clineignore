@@ -1,0 +1,21 @@
+# Бинарники и справка
+**/*.cf
+**/*.cfe
+**/*.png
+**/Help/**
+**/Images/**
+
+# Тяжёлые макеты, СКД и служебные XML 1С (код .bsl остаётся полностью открытым)
+**/Templates/**
+**/Ext/Predefined.xml
+**/Ext/Rights.xml
+**/Ext/CommandInterface.xml
+**/*.mxl
+**/*.dcs
+**/*.xsd
+**/*.bin
+**/*.txt
+
+**/Forms/**/Ext/Form.xml
+# Дубль индекса парсера (агент должен работать только через INDEX.md и bug_XX.md)
+log-analysis/bugs_report_anon.txt

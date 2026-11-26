@@ -16,6 +16,7 @@ TASKS_DIR = os.path.normpath(os.path.join(BASE_DIR, '..', 'tasks'))
 INVALID_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 SINGLE_LINE_USER_MSG = re.compile(r'^\{[^}]+\}:\s*.+$')
 STACK_LINE_RE = re.compile(r'\{([^}]+)\((\d+)\)\}:(.*)$')
+PROC_HEADER_RE = re.compile(r'^\s*(Процедура|Функция)\s+([А-ЯЁA-Z0-9_]+)', re.IGNORECASE)
 
 UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
 QUOTED_RE = re.compile(r'["\'][^"\']+["\']')
@@ -178,7 +179,6 @@ def resolve_1c_path(stack_location):
                 if os.path.isdir(os.path.join(ext_root, entry)):
                     candidates.append(f"Extensions/{entry}/{rel_path}")
 
-
     for candidate in candidates:
         full_check_path = os.path.normpath(os.path.join(CONFIG_DUMP_REL, candidate))
         if os.path.exists(full_check_path):
@@ -186,6 +186,132 @@ def resolve_1c_path(stack_location):
 
     return f"config-dump/{candidates[0]}", False
 
+
+def extract_bsl_context(bsl_rel_path, line_num_str, radius=35):
+    """Извлекает имя процедуры/функции и фрагмент кода ±radius строк вокруг места сбоя."""
+    try:
+        target_line = int(line_num_str)
+    except ValueError:
+        return None, None
+
+    rel_inside_dump = bsl_rel_path.replace('config-dump/', '', 1)
+    full_path = os.path.normpath(os.path.join(CONFIG_DUMP_REL, rel_inside_dump))
+    if not os.path.exists(full_path):
+        return None, None
+
+    try:
+        with open(full_path, 'r', encoding='utf-8-sig', errors='replace') as f:
+            file_lines = f.read().splitlines()
+    except Exception:
+        return None, None
+
+    total_lines = len(file_lines)
+    if target_line < 1 or target_line > total_lines:
+        return None, None
+
+    proc_name = None
+    for idx in range(target_line - 1, -1, -1):
+        line_str = file_lines[idx]
+        m = PROC_HEADER_RE.match(line_str)
+        if m:
+            proc_type = m.group(1)
+            name = m.group(2)
+            directive = ""
+            if idx > 0 and file_lines[idx - 1].strip().startswith('&'):
+                directive = f"{file_lines[idx - 1].strip()} "
+            proc_name = f"{directive}{proc_type} {name}()"
+            break
+
+    start_idx = max(0, target_line - 1 - radius)
+    end_idx = min(total_lines, target_line + radius)
+
+    snippet_lines = []
+    for i in range(start_idx, end_idx):
+        curr_num = i + 1
+        clean_line = file_lines[i].replace('\t', '    ')
+        marker = "// >>> ОШИБКА ЗДЕСЬ:" if curr_num == target_line else ""
+        if marker:
+            snippet_lines.append(f"{marker}\n{clean_line}")
+        else:
+            snippet_lines.append(clean_line)
+
+
+    return proc_name, "\n".join(snippet_lines)
+
+
+def _get_ru_title(elem):
+    """Достаёт русский текст из узла <Title> или <Synonym> в Form.xml 1С."""
+    for child in elem:
+        tag = strip_ns(child.tag)
+        if tag in ('Title', 'Synonym'):
+            for item in child.iter():
+                if strip_ns(item.tag) == 'item':
+                    lang = ''
+                    content = ''
+                    for sub in item:
+                        stag = strip_ns(sub.tag)
+                        if stag == 'lang':
+                            lang = (sub.text or '').strip()
+                        elif stag == 'content':
+                            content = (sub.text or '').strip()
+                    if lang == 'ru' and content:
+                        return content
+            if child.text and child.text.strip():
+                return child.text.strip()
+    return None
+
+
+def extract_form_ui_context(bsl_rel_path):
+    """Если модуль принадлежит форме (кроме общей формы отчета БСП), вытягивает русские заголовки из Form.xml."""
+    if not bsl_rel_path.endswith('/Ext/Form/Module.bsl'):
+        return None
+    if 'CommonForms/ФормаОтчета/' in bsl_rel_path:
+        return None
+
+    rel_inside_dump = bsl_rel_path.replace('config-dump/', '', 1)
+    form_xml_rel = rel_inside_dump.replace('/Ext/Form/Module.bsl', '/Ext/Form.xml')
+    full_xml_path = os.path.normpath(os.path.join(CONFIG_DUMP_REL, form_xml_rel))
+
+    if not os.path.exists(full_xml_path):
+        return None
+
+    try:
+        tree = ET.parse(full_xml_path)
+        root = tree.getroot()
+    except Exception:
+        return None
+
+    form_title = _get_ru_title(root)
+    commands = []
+    fields = []
+
+    for elem in root.iter():
+        tag = strip_ns(elem.tag)
+        if tag == 'Command':
+            cmd_name = elem.attrib.get('name', '')
+            ru_title = _get_ru_title(elem)
+            if cmd_name and ru_title and len(commands) < 25:
+                commands.append(f"`{cmd_name}` → **«{ru_title}»**")
+        elif tag in ('InputField', 'CheckBoxField', 'RadioButtonField', 'Button', 'CommandBarButton', 'Table'):
+            el_name = elem.attrib.get('name', '')
+            ru_title = _get_ru_title(elem)
+            if el_name and ru_title and len(fields) < 35:
+                entry = f"`{el_name}` → **«{ru_title}»**"
+                if entry not in fields and entry not in commands:
+                    fields.append(entry)
+
+    if not form_title and not commands and not fields:
+        return None
+
+    lines = ["## Контекст интерфейса формы (из Form.xml)\n"]
+    if form_title:
+        lines.append(f"- **Заголовок окна формы:** «{form_title}»")
+    if commands:
+        lines.append("- **Команды / Кнопки формы:** " + "; ".join(commands))
+    if fields:
+        lines.append("- **Элементы / Поля формы:** " + "; ".join(fields))
+    lines.append("")
+    return "\n".join(lines)
 
 
 def extract_stack_targets(lines):
@@ -201,12 +327,20 @@ def extract_stack_targets(lines):
                 key = (bsl_path, line_num)
                 if key not in seen:
                     seen.add(key)
+                    proc_name, code_block = (None, None)
+                    ui_context = None
+                    if exists:
+                        proc_name, code_block = extract_bsl_context(bsl_path, line_num)
+                        ui_context = extract_form_ui_context(bsl_path)
                     targets.append({
                         'bsl_path': bsl_path,
                         'line': line_num,
                         'exists': exists,
                         'snippet': code_snippet,
                         'raw_loc': loc,
+                        'proc_name': proc_name,
+                        'code_block': code_block,
+                        'ui_context': ui_context,
                     })
     return targets
 
@@ -401,16 +535,40 @@ def main():
             md.append("## Файлы конфигурации для анализа\n")
             for t in info['targets']:
                 status = "найден" if t['exists'] else "не найден в config-dump"
-                md.append(f"- `{t['bsl_path']}` — **строка {t['line']}** ({status})")
+                proc_info = f" | Метод: `{t['proc_name']}`" if t.get('proc_name') else ""
+                md.append(f"- `{t['bsl_path']}` — **строка {t['line']}** ({status}){proc_info}")
                 if t['snippet']:
                     md.append(f"  - Код в стеке: `{t['snippet']}`")
-            md.append("\n## Инструкция для агента\n")
-            md.append(
-                f"Открой указанный файл `{first_target['bsl_path']}` вокруг строки **{first_target['line']}** "
-                "(прочитай ±50 строк) и проследи стек вызовов от действия пользователя к месту сбоя. "
-                "Определи: 1) Точное место, 2) Причину падения, 3) Пошаговые сценарии воспроизведения "
-                "в пользовательском режиме (от самого вероятного к менее вероятным). Исправления кода не пиши."
-            )
+            md.append("")
+
+            embedded_count = 0
+            for t in info['targets']:
+                if t.get('code_block') and embedded_count < 2:
+                    proc_label = f" — `{t['proc_name']}`" if t.get('proc_name') else ""
+                    md.append(f"## Фрагмент кода: `{t['bsl_path']}:{t['line']}`{proc_label}\n")
+                    md.append("```bsl")
+                    md.append(t['code_block'])
+                    md.append("```\n")
+                    embedded_count += 1
+
+            for t in info['targets']:
+                if t.get('ui_context'):
+                    md.append(t['ui_context'])
+                    break
+
+            md.append("## Инструкция для агента\n")
+            if first_target.get('code_block'):
+                md.append(
+                    "Фрагмент исходного `.bsl` и элементы интерфейса формы (если применимо) уже встроены выше. "
+                    "**Не вызывай `read_file` для этого файла**, если контекста выше достаточно для понимания причины сбоя. "
+                    "Определи: 1) Точное место и имя процедуры, 2) Причину падения, 3) Пошаговые сценарии воспроизведения "
+                    "в пользовательском режиме (от самого вероятного к менее вероятным). Исправления кода не пиши."
+                )
+            else:
+                md.append(
+                    f"Модуль `{first_target['bsl_path']}` не найден в `config-dump` (возможно, типовой или в другой базе). "
+                    "Сразу пиши диагноз по тексту исключения и стеку выше без поиска файлов в терминале."
+                )
             primary_target = f"`{first_target['bsl_path']}:{first_target['line']}`"
         else:
             md.append("## Инструкция для агента\n")
