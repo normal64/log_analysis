@@ -15,7 +15,7 @@ TASKS_DIR = os.path.normpath(os.path.join(BASE_DIR, '..', 'tasks'))
 
 INVALID_XML_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 SINGLE_LINE_USER_MSG = re.compile(r'^\{[^}]+\}:\s*.+$')
-STACK_LINE_RE = re.compile(r'^\{([^}]+)\((\d+)\)\}:(.*)$')
+STACK_LINE_RE = re.compile(r'\{([^}]+)\((\d+)\)\}:(.*)$')
 
 UUID_RE = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
 QUOTED_RE = re.compile(r'["\'][^"\']+["\']')
@@ -119,6 +119,12 @@ def make_signature(lines):
 
 
 def resolve_1c_path(stack_location):
+    ext_name = None
+    if ' ' in stack_location:
+        ext_name, stack_location = stack_location.split(' ', 1)
+        ext_name = ext_name.strip()
+        stack_location = stack_location.strip()
+
     parts = stack_location.split('.')
     if len(parts) < 2:
         return None
@@ -157,16 +163,36 @@ def resolve_1c_path(stack_location):
     if not rel_path:
         return None
 
-    full_check_path = os.path.normpath(os.path.join(CONFIG_DUMP_REL, rel_path))
-    exists = os.path.exists(full_check_path)
-    return f"config-dump/{rel_path}", exists
+    candidates = []
+    if ext_name:
+        candidates.extend([
+            f"Extensions/{ext_name}/{rel_path}",
+            f"{ext_name}/{rel_path}",
+            rel_path,
+        ])
+    else:
+        candidates.append(rel_path)
+        ext_root = os.path.join(CONFIG_DUMP_REL, 'Extensions')
+        if os.path.isdir(ext_root):
+            for entry in sorted(os.listdir(ext_root)):
+                if os.path.isdir(os.path.join(ext_root, entry)):
+                    candidates.append(f"Extensions/{entry}/{rel_path}")
+
+
+    for candidate in candidates:
+        full_check_path = os.path.normpath(os.path.join(CONFIG_DUMP_REL, candidate))
+        if os.path.exists(full_check_path):
+            return f"config-dump/{candidate}", True
+
+    return f"config-dump/{candidates[0]}", False
+
 
 
 def extract_stack_targets(lines):
     targets = []
     seen = set()
     for line in lines:
-        m = STACK_LINE_RE.match(line)
+        m = STACK_LINE_RE.search(line)
         if m:
             loc, line_num, code_snippet = m.group(1), m.group(2), m.group(3).strip()
             resolved = resolve_1c_path(loc)
